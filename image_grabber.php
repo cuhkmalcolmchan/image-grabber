@@ -1,27 +1,45 @@
 <?php
+	ini_set("display_errors", "Off");
+
 	if (isset($_REQUEST["url"])) {
 		include_once("common-inc.php");
 		
 		$image_url = filter_var($_REQUEST["url"], FILTER_SANITIZE_URL);
-		$image_data = file_get_contents($image_url);
-		$output["name"] = pathinfo($image_url, PATHINFO_FILENAME);
-		$output["type"] = pathinfo($image_url, PATHINFO_EXTENSION);
-		$output["status"] = parseHeaders($http_response_header);
-		$output["url"] = $image_url;
-		
-		if ($output["status"]["response_code"] == 200 && strpos($output["status"]["Content-Type"], "image") === 0) {
-			$output["data"] = base64_encode($image_data);
-		} else {
-			switch ($output["status"]["response_code"]) {
-				case 200: 
-					$output["error"] = "NOT_IMAGE";
-					break;
-				case 403: 
-				case 404: 
-				default: 
-					$output["error"] = $output["status"][0];
-					break;
+
+		if (!empty($_REQUEST["username"])) {
+			// Basic Auth
+			// https://stackoverflow.com/questions/30628361/php-basic-auth-file-get-contents
+			$auth = base64_encode($_REQUEST["username"] . ":" . $_REQUEST["password"]);
+			$context = stream_context_create(array(
+				"http" => array(
+					"header" => "Authorization: Basic $auth"
+				)
+			));
+		}
+
+		try {
+			$image_data = file_get_contents($image_url, false, $context);
+			$output["name"] = pathinfo($image_url, PATHINFO_FILENAME);
+			$output["type"] = pathinfo($image_url, PATHINFO_EXTENSION);
+			$output["status"] = parseHeaders($http_response_header);
+			$output["url"] = $image_url;
+			
+			if ($output["status"]["response_code"] == 200 && strpos($output["status"]["Content-Type"], "image") === 0) {
+				$output["data"] = base64_encode($image_data);
+			} else {
+				switch ($output["status"]["response_code"]) {
+					case 200: 
+						$output["error"] = "NOT_IMAGE";
+						break;
+					case 403: 
+					case 404: 
+					default: 
+						$output["error"] = $output["status"][0];
+						break;
+				}
 			}
+		} catch (Exception $ex) {
+			$output["error"] = $ex->getMessage();
 		}
 		
 		header("Content-Type: application/json");
@@ -45,11 +63,21 @@
 			var imageGrabber = {
 				serviceUrl: window.location, 
 				targetUrls: [], 
+				authentication: {
+					username: null, 
+					password: null
+				}, 
 				cursor: 0, 
 				completed: 0, 
 				timer: null, 
 				interval: 500, 
 				addToQueue: function (url, options) {
+					if (url instanceof Array) {
+						for (var i = 0; i < url.length; i++)
+							this.addToQueue(url[i], options);
+						return;
+					}
+					
 					options = options || {};
 					if (options.jump)
 						imageGrabber.targetUrls.splice(imageGrabber.cursor + 1, 0, url);
@@ -84,16 +112,71 @@
 					//imageGrabber.timer = setTimeout(nextInQueue, imageGrabber.interval);
 					nextInQueue();
 				}, 
+				setHTTPAuthentication: function (username, password) {
+					imageGrabber.authentication.username = username;
+					imageGrabber.authentication.password = password;
+				}, 
 				fn: {
 					getImage: function (url) {
 						$.post({
 							url: imageGrabber.serviceUrl, 
 							data: {
-								url: url
+								url: url, 
+								username: imageGrabber.authentication.username, 
+								password: imageGrabber.authentication.password
 							}, 
 							dataType: "json"
 						})
+						.done(function (data) {
+							if (!imageGrabber.fn.processImage(data))
+								document.dispatchEvent(new CustomEvent(
+									"ig-queue-item-error", 
+									{
+										detail: {
+											message: "IMAGE_NOT_PROCESSED", 
+											description: ((data.name && data.type) ? ("when retrieving " + data.name + "." + data.type) : "") + (data.url ? (" from " + data.url + ".") : ""), 
+											severity: "error"
+										}, 
+										bubbles: true, 
+										cancelable: true
+									}
+								));
+						})
+						.fail(function (data) {
+							document.dispatchEvent(new CustomEvent(
+								"ig-queue-item-error", 
+								{
+									detail: {
+										message: "REQUEST_FAILED", 
+										description: url, 
+										severity: "error"
+									}, 
+									bubbles: true, 
+									cancelable: true
+								}
+							));
+						})
 						.always(function (data) {
+							var error = false;
+							
+							if (!data || data.error)
+								error = true;
+							
+							if (error) {
+								document.dispatchEvent(new CustomEvent(
+									"ig-queue-item-error", 
+									{
+										detail: {
+											message: "Error " + data.error, 
+											description: ((data.name && data.type) ? ("when retrieving " + data.name + "." + data.type) : "") + (data.url ? (" from " + data.url + ".") : ""), 
+											severity: "error"
+										}, 
+										bubbles: true, 
+										cancelable: true
+									}
+								));
+							}
+
 							imageGrabber.completed++;
 							
 							if (imageGrabber.completed >= imageGrabber.targetUrls.length)
@@ -107,35 +190,6 @@
 										cancelable: true
 									}
 								));
-						})
-						.done(function (data) {
-							if (!data || data.error) {
-								var errorMessageTitle = "Error " + data.error, 
-									errorMessageBody = ((data.name && data.type) ? ("when retrieving " + data.name + "." + data.type) : "") + (data.url ? (" from " + data.url + ".") : ""), 
-									calloutElement = $("<div />", {
-										class: "bs-callout bs-callout-danger"
-									}), 
-									errorTitleElement = $("<h4 />", {
-										html: errorMessageTitle
-									}).appendTo(calloutElement),
-									errorBodyElement = $("<p />", {
-										html: errorMessageBody
-									}).appendTo(calloutElement);
-								
-								console.log(errorMessageTitle + " " + errorMessageBody);
-								
-								var errorContainer = $("#errors");
-								
-								errorContainer.append(calloutElement).animate({ scrollTop: errorContainer.prop("scrollHeight") - errorContainer.height() }, "fast");
-								throw new Error("IMAGE_BAD_FORMAT");
-								return false;
-							}
-							
-							if (!imageGrabber.fn.processImage(data))
-								throw new Error("IMAGE_NOT_PROCESSED");
-						})
-						.fail(function (data) {
-							throw new Error("REQUEST_FAILED");
 						});
 					}, 
 					processImage: function (data) {
@@ -146,7 +200,8 @@
 								}), 
 								imgElement = $("<img />", {
 									src: dataUrl, 
-									alt: data.name
+									alt: data.name, 
+									download: data.name + "." + data.type
 								}).appendTo(divElement);
 							
 							if ($("#container").append(divElement).length > 0) {
@@ -171,8 +226,43 @@
 				document.addEventListener("ig-queue-done", function (e) {
 					//alert(e.detail.message);
 					console.log(e.detail.message);
+					showMessage(e.detail);
 				}, false);
+
+				document.addEventListener("ig-queue-item-error", function (e) {
+					showMessage(e.detail);
+				});
+
+				$(document).on("click", "img", function () {
+					$a = $("<a href=\"" + this.src.replace(/^data:image\/[^;]/, "data:application/octet-stream") + "\" target=\"_blank\" download=\"" + $(this).attr("download") + "\">Download</a>");
+					$a.appendTo("#links").get(0).click();
+					//location.href = this.src.replace(/^data:image\/[^;]/, "data:application/octet-stream");
+				});
 			});
+
+			function showMessage(detail) {
+				var messageTitle = detail.message, 
+					messageBody = detail.description, 
+					calloutElement = $("<div />", {
+						class: "bs-callout " + (detail.severity === "error" ? "bs-callout-danger" : "bs-callout-info")
+					}), 
+					titleElement = $("<h4 />", {
+						html: messageTitle
+					}).appendTo(calloutElement),
+					bodyElement = $("<p />", {
+						html: messageBody
+					}).appendTo(calloutElement);
+				
+				var container = $("#errors");
+				
+				container.append(calloutElement).animate({ scrollTop: container.prop("scrollHeight") - container.height() }, "fast");
+			}
+
+			function batchDownload() {
+				$("img").each(function () {
+					$(this).trigger("click");
+				});
+			}
 			
 			var sampleQueue = [];
 			
@@ -230,6 +320,10 @@
 				width: 100%;
 				height: 100%;
 				position: fixed;
+			}
+
+			img {
+				cursor: pointer;
 			}
 			
 			#btn-row {
@@ -323,15 +417,19 @@
 	</head>
 	<body class="container-fluid">
 		<div id="btn-row" class="row">
-			<button class="form-control col-sm-4" onclick="sampleQueue[0]();">Run Sample Queue (Windows 7 Sample Pictures)</button>
-			<button class="form-control col-sm-4" onclick="sampleQueue[1]();">Run Sample Queue (Placeholders)</button>
-			<button class="form-control col-sm-4" onclick="sampleQueue[2]();">Run Sample Queue (Real pictures)</button>
+			<button class="form-control col-sm-3" onclick="sampleQueue[0]();">Run Sample Queue (Windows 7 Sample Pictures)</button>
+			<button class="form-control col-sm-3" onclick="sampleQueue[1]();">Run Sample Queue (Placeholders)</button>
+			<button class="form-control col-sm-3" onclick="sampleQueue[2]();">Run Sample Queue (Real pictures)</button>
+			<button class="form-control col-md-3" onclick="batchDownload();">Download All Images</button>
 		</div>
 		<div id="container" class="row">
 			
 		</div>
 		
 		<div id="errors" class="container-fluid">
+			
+		</div>
+		<div id="links" style="display: none;">
 			
 		</div>
 	</body>
